@@ -458,6 +458,22 @@ const SCOPES       = 'user-read-recently-played user-read-private';
 const STORAGE_KEY  = 'albummark_client_id';
 const TOKEN_KEY    = 'albummark_token';
 const EXPIRY_KEY   = 'albummark_token_expiry';
+const VERIFIER_KEY = 'albummark_pkce_verifier';
+
+// ── PKCE HELPERS ─────────────────────────────────────────
+function generateVerifier(length = 128) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+  const arr = new Uint8Array(length);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map(b => chars[b % chars.length]).join('');
+}
+
+async function generateChallenge(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 
 // ── INIT ────────────────────────────────────────────────
 document.getElementById('redirect-uri-display').textContent = REDIRECT_URI;
@@ -473,18 +489,51 @@ document.getElementById('show-instructions').addEventListener('click', e => {
 
 // ── CHECK FOR OAUTH CALLBACK ─────────────────────────────
 (async () => {
-  const hash = window.location.hash.substring(1);
-  const params = new URLSearchParams(hash);
-  const accessToken = params.get('access_token');
-  const expiresIn   = params.get('expires_in');
+  const urlParams = new URLSearchParams(window.location.search);
+  const code      = urlParams.get('code');
+  const error     = urlParams.get('error');
 
-  if (accessToken) {
-    // Clear hash from URL
+  if (error) {
     history.replaceState(null, '', window.location.pathname);
-    const expiry = Date.now() + parseInt(expiresIn) * 1000;
-    localStorage.setItem(TOKEN_KEY, accessToken);
-    localStorage.setItem(EXPIRY_KEY, expiry);
-    showApp(accessToken);
+    document.getElementById('setup-screen').style.display = 'flex';
+    alert('Spotify login was cancelled or failed: ' + error);
+    return;
+  }
+
+  if (code) {
+    history.replaceState(null, '', window.location.pathname);
+    const verifier  = localStorage.getItem(VERIFIER_KEY);
+    const clientId  = localStorage.getItem(STORAGE_KEY);
+    if (!verifier || !clientId) {
+      document.getElementById('setup-screen').style.display = 'flex';
+      return;
+    }
+
+    // Exchange code for token
+    try {
+      const res = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type:    'authorization_code',
+          code,
+          redirect_uri:  REDIRECT_URI,
+          client_id:     clientId,
+          code_verifier: verifier,
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error_description || data.error || 'Token exchange failed');
+
+      const expiry = Date.now() + data.expires_in * 1000;
+      localStorage.setItem(TOKEN_KEY,    data.access_token);
+      localStorage.setItem(EXPIRY_KEY,   expiry);
+      localStorage.removeItem(VERIFIER_KEY);
+      showApp(data.access_token);
+    } catch (err) {
+      document.getElementById('setup-screen').style.display = 'flex';
+      alert('Login failed: ' + err.message);
+    }
     return;
   }
 
@@ -501,7 +550,7 @@ document.getElementById('show-instructions').addEventListener('click', e => {
 })();
 
 // ── CONNECT BUTTON ────────────────────────────────────────
-document.getElementById('connect-btn').addEventListener('click', () => {
+document.getElementById('connect-btn').addEventListener('click', async () => {
   const clientId = document.getElementById('client-id-input').value.trim();
   if (!clientId) {
     alert('Please enter your Spotify Client ID.');
@@ -509,13 +558,18 @@ document.getElementById('connect-btn').addEventListener('click', () => {
   }
   localStorage.setItem(STORAGE_KEY, clientId);
 
-  const state = Math.random().toString(36).substring(2);
-  const url = `https://accounts.spotify.com/authorize?` +
-    `client_id=${encodeURIComponent(clientId)}` +
-    `&response_type=token` +
-    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
-    `&scope=${encodeURIComponent(SCOPES)}` +
-    `&state=${state}`;
+  const verifier  = generateVerifier();
+  const challenge = await generateChallenge(verifier);
+  localStorage.setItem(VERIFIER_KEY, verifier);
+
+  const url = 'https://accounts.spotify.com/authorize?' + new URLSearchParams({
+    client_id:             clientId,
+    response_type:         'code',
+    redirect_uri:          REDIRECT_URI,
+    scope:                 SCOPES,
+    code_challenge_method: 'S256',
+    code_challenge:        challenge,
+  });
   window.location = url;
 });
 
